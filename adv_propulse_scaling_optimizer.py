@@ -12,7 +12,7 @@ from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
 KNOT_TO_MS = 0.514444
 DEFAULT_REF_DIAMETER_M = 0.300
-DEFAULT_REF_BLADE_LENGTH_M = 5.61
+DEFAULT_REF_BLADE_LENGTH_M = 5.00
 DEFAULT_BLADES = 3.0
 
 
@@ -60,6 +60,8 @@ class Surrogate3D:
         self.lambda_candidates = sorted(df[self.input_cols[1]].dropna().unique().astype(float).tolist())
         self.bmax_candidates = sorted(df[self.input_cols[2]].dropna().unique().astype(float).tolist())
         self.v_candidates = sorted(df[self.input_cols[0]].dropna().unique().astype(float).tolist())
+        self.database_orbital_diameter_m = float(df.attrs.get("database_orbital_diameter_m", DEFAULT_REF_DIAMETER_M))
+        self.cleaning_report = dict(df.attrs.get("cleaning_report", {}))
 
     def __call__(self, V_ms: float, lam: float, bmax_deg: float) -> Dict[str, float]:
         p = np.array([[float(V_ms), float(lam), float(bmax_deg)]], dtype=float)
@@ -101,6 +103,135 @@ class Surrogate3D:
             ]
         )
         return diagnostics
+
+
+
+
+def _normalize_power_of_1000(value: float, lower: float, upper: float) -> float:
+    """Ramène une valeur dans une plage plausible en corrigeant les pertes de séparateur décimal x1000."""
+    x = float(value)
+    if not np.isfinite(x) or x == 0:
+        return x
+    ax = abs(x)
+    sign = -1.0 if x < 0 else 1.0
+    for _ in range(4):
+        if ax < lower:
+            ax *= 1000.0
+        elif ax > upper:
+            ax /= 1000.0
+        else:
+            break
+    return sign * ax
+
+
+def infer_database_orbital_diameter(df: pd.DataFrame, fallback_m: float = DEFAULT_REF_DIAMETER_M) -> float:
+    """Déduit D_orb de lambda = V/(omega D/2), en corrigeant les x1000 présents dans le classeur."""
+    required = {"Ve [m/s]", "Lambda [-]", "omega [rad/s]"}
+    if not required.issubset(df.columns):
+        return float(fallback_m)
+    v = pd.to_numeric(df["Ve [m/s]"], errors="coerce").to_numpy(dtype=float)
+    lam = pd.to_numeric(df["Lambda [-]"], errors="coerce").to_numpy(dtype=float)
+    omega = pd.to_numeric(df["omega [rad/s]"], errors="coerce").to_numpy(dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        candidates = 2.0 * v / (lam * omega)
+    normalized = []
+    for x in candidates:
+        if not np.isfinite(x) or x <= 0:
+            continue
+        normalized.append(_normalize_power_of_1000(float(x), 0.02, 20.0))
+    normalized = np.asarray([x for x in normalized if 0.02 <= x <= 20.0], dtype=float)
+    if normalized.size < 10:
+        return float(fallback_m)
+    return float(np.median(normalized))
+
+
+def _repair_v2_scaled_column(data: pd.DataFrame, column: str) -> int:
+    """Corrige des x1000 isolés sur une grandeur ~V², à lambda/Bmax fixés."""
+    if column not in data.columns:
+        return 0
+    corrected = 0
+    out = data[column].astype(float).copy()
+    for _, idx in data.groupby(["Lambda [-]", "Bmax[°]"], dropna=False).groups.items():
+        idx = list(idx)
+        vals = out.loc[idx].to_numpy(dtype=float)
+        speeds = data.loc[idx, "Ve [m/s]"].to_numpy(dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            norm = np.abs(vals) / np.maximum(speeds ** 2, 1e-12)
+            logs = np.log10(norm)
+        finite = np.isfinite(logs)
+        if finite.sum() < 3:
+            continue
+        center = float(np.median(logs[finite]))
+        for j, row_idx in enumerate(idx):
+            if not np.isfinite(vals[j]) or vals[j] == 0:
+                continue
+            factors = np.array([0.001, 1.0, 1000.0])
+            cand = np.abs(vals[j] * factors) / max(speeds[j] ** 2, 1e-12)
+            dist = np.abs(np.log10(cand) - center)
+            factor = float(factors[int(np.argmin(dist))])
+            if factor != 1.0:
+                out.loc[row_idx] = vals[j] * factor
+                corrected += 1
+    data[column] = out
+    return corrected
+
+
+def sanitize_summary_data(data: pd.DataFrame, database_diameter_m: float) -> Dict[str, int]:
+    """Répare les pertes aléatoires de séparateur décimal du fichier sans modifier DHP, utilisé comme ancre."""
+    report: Dict[str, int] = {}
+    v = data["Ve [m/s]"].to_numpy(dtype=float)
+    lam = data["Lambda [-]"].to_numpy(dtype=float)
+    omega = 2.0 * v / (lam * float(database_diameter_m))
+
+    if "omega [rad/s]" in data.columns:
+        old = data["omega [rad/s]"].to_numpy(dtype=float)
+        report["omega_repaired"] = int(np.sum(~np.isclose(old, omega, rtol=1e-4, atol=1e-6)))
+        data["omega [rad/s]"] = omega
+    if "omega [rpm]" in data.columns:
+        rpm = omega * 60.0 / (2.0 * np.pi)
+        old = data["omega [rpm]"].to_numpy(dtype=float)
+        report["rpm_repaired"] = int(np.sum(~np.isclose(old, rpm, rtol=1e-4, atol=1e-4)))
+        data["omega [rpm]"] = rpm
+
+    # DHP est cohérent et lisse dans la base. On l'utilise pour réparer le couple moyen.
+    if "DHP[W]" in data.columns and "Cp_mean[N.m]" in data.columns:
+        q = data["DHP[W]"].to_numpy(dtype=float) / omega
+        old = data["Cp_mean[N.m]"].to_numpy(dtype=float)
+        report["Cp_mean_repaired"] = int(np.sum(~np.isclose(old, q, rtol=1e-4, atol=1e-5)))
+        data["Cp_mean[N.m]"] = q
+
+    # Eta est borné et certaines cellules sont exactement x1000.
+    if "eta_Cp[%]" in data.columns:
+        eta_old = data["eta_Cp[%]"].to_numpy(dtype=float)
+        eta_norm = np.array([_normalize_power_of_1000(x, 0.01, 100.0) for x in eta_old])
+        report["eta_repaired"] = int(np.sum(~np.isclose(eta_old, eta_norm, rtol=1e-8, atol=1e-10)))
+        data["eta_Cp[%]"] = eta_norm
+
+    # Corrige la poussée avec la redondance eta = -T V / DHP.
+    if {"eta_Cp[%]", "thrust[N]", "DHP[W]"}.issubset(data.columns):
+        eta = data["eta_Cp[%]"].to_numpy(dtype=float)
+        raw_t = data["thrust[N]"].to_numpy(dtype=float)
+        power = data["DHP[W]"].to_numpy(dtype=float)
+        repaired_t = raw_t.copy()
+        count = 0
+        for i in range(len(data)):
+            if not all(np.isfinite(x) for x in [eta[i], raw_t[i], power[i], v[i]]) or power[i] == 0 or v[i] == 0:
+                continue
+            factors = np.array([0.001, 1.0, 1000.0])
+            eta_candidates = -raw_t[i] * factors * v[i] / power[i] * 100.0
+            valid = eta_candidates > 0
+            errors = np.where(valid, np.abs(np.log(np.maximum(eta_candidates, 1e-12) / max(eta[i], 1e-12))), np.inf)
+            factor = float(factors[int(np.argmin(errors))])
+            if factor != 1.0:
+                repaired_t[i] = raw_t[i] * factor
+                count += 1
+        data["thrust[N]"] = repaired_t
+        data["eta_Cp[%]"] = -repaired_t * v / power * 100.0
+        report["thrust_repaired"] = count
+
+    for col in ["sideforce[N]", "Mh max", "Cd_mean[N.m]"]:
+        report[f"{col}_repaired"] = _repair_v2_scaled_column(data, col)
+    return report
 
 
 def knots_to_ms(knots: float) -> float:
@@ -152,7 +283,10 @@ def load_summary(path: str | Path, summary_sheet: str = "Summary") -> pd.DataFra
     if missing:
         raise ValueError(f"Colonnes manquantes dans '{sheet_name}': {missing}")
 
-    data = data.dropna(subset=required)
+    data = data.dropna(subset=required).reset_index(drop=True)
+
+    database_diameter_m = infer_database_orbital_diameter(data)
+    cleaning_report = sanitize_summary_data(data, database_diameter_m)
 
     if "thrust[N]" in data.columns:
         data["thrust_propulsive[N]"] = -data["thrust[N]"]
@@ -160,7 +294,9 @@ def load_summary(path: str | Path, summary_sheet: str = "Summary") -> pd.DataFra
         data["sideforce_abs[N]"] = data["sideforce[N]"].abs()
 
     data.attrs["sheet_name"] = sheet_name
-    return data.reset_index(drop=True)
+    data.attrs["database_orbital_diameter_m"] = float(database_diameter_m)
+    data.attrs["cleaning_report"] = cleaning_report
+    return data
 
 
 def build_surrogate(df: pd.DataFrame) -> Surrogate3D:
@@ -338,6 +474,14 @@ def evaluate_target_case(
     target_blade_length_m: Optional[float] = None,
     ref_blade_length_m: Optional[float] = None,
 ) -> Dict[str, float]:
+    inferred_ref = float(getattr(surrogate, "database_orbital_diameter_m", D_ref_m))
+    if not np.isclose(float(D_ref_m), inferred_ref, rtol=0.02, atol=1e-6):
+        raise ValueError(
+            f"Diametre de reference incoherent avec la base: {D_ref_m:.6g} m fourni, "
+            f"{inferred_ref:.6g} m deduit de V, lambda et omega. "
+            "Le diametre de base ne doit pas etre remplace par une dimension de la machine reelle."
+        )
+
     V_ref_ms, chord_ratio_used = equivalent_reference_speed(
         V_target_ms=V_target_ms,
         D_target_m=D_target_m,

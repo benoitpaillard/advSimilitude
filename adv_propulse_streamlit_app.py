@@ -136,8 +136,8 @@ def main() -> None:
 
     st.title(APP_TITLE)
     st.caption(
-        "Interface web cross-platform pour la mise a l'echelle et l'optimisation ADV-propulse. "
-        "La base Excel bundlee est chargee automatiquement si elle est presente a cote de l'application."
+        "Mise a l'echelle et optimisation ADV-propulse. Le diametre orbital de la base est deduit "
+        "automatiquement de V, lambda et omega; les pertes de separateur decimal x1000 sont reparees au chargement."
     )
 
     with st.sidebar:
@@ -157,10 +157,19 @@ def main() -> None:
         mode = st.radio("Mode", ["Optimisation", "Evaluation d'un point"], index=0)
         diameter_mm = st.number_input("Diametre cible [mm]", min_value=1.0, value=200.0, step=10.0)
         speed_kn = st.number_input("Vitesse cible [kn]", min_value=0.1, value=10.0, step=0.5)
-        reference_diameter_mm = st.number_input("Diametre de reference [mm]", min_value=1.0, value=300.0, step=10.0)
+        st.text_input(
+            "Diametre orbital de la base",
+            value="Detecte automatiquement (300 mm pour la base bundlee)",
+            disabled=True,
+            help="Cette valeur appartient a l'abaque CFD et ne doit pas etre remplacee par une dimension de la machine reelle.",
+        )
 
         st.markdown("---")
-        iso_re = st.checkbox("Correction iso-Reynolds", value=True)
+        iso_re = st.checkbox(
+            "Correction iso-Reynolds",
+            value=False,
+            help="A activer seulement si la comparaison de corde est definie et si la vitesse equivalente reste dans le domaine de l'abaque.",
+        )
         reynolds_mode = "diameter"
         chord_ratio_text = ""
         sigma_target_text = ""
@@ -198,7 +207,8 @@ def main() -> None:
         )
         target_blade_length_text = st.text_input("Longueur de pale cible [m] (utilisee en 2d)", value="")
         reference_blade_length_text = st.text_input(
-            "Longueur de pale de reference [m] (utilisee en 2d)", value="5.61"
+            "Longueur de pale effective utilisee au post-traitement de la base [m]", value="5.00",
+            help="Valeur calibree provisoirement autour de 5 m sur les cas P200, P75.6 et le point de bollard-pull. A remplacer si la valeur originale est retrouvee."
         )
 
         st.markdown("---")
@@ -213,10 +223,14 @@ def main() -> None:
             max_dhp = st.text_input("DHP max [W]", value="")
             lambda_value = None
             bmax_value = None
+            measured_dhp_kw_text = ""
         else:
             objective = "max_eta"
             lambda_value = st.number_input("Lambda impose", min_value=0.01, value=1.3, step=0.1)
             bmax_value = st.number_input("Bmax impose [deg]", min_value=0.0, value=15.0, step=2.5)
+            measured_dhp_kw_text = st.text_input(
+                "DHP mesuree connue [kW] (optionnel, pour calibrer la longueur effective)", value=""
+            )
             min_thrust = max_mh = max_dhp = ""
 
         run = st.button("Lancer", type="primary", use_container_width=True)
@@ -242,9 +256,19 @@ def main() -> None:
         else:
             _, df, surrogate = build_surrogate_from_path(str(bundled_workbook))
 
+        inferred_diameter_m = float(df.attrs.get("database_orbital_diameter_m", core.DEFAULT_REF_DIAMETER_M))
+        cleaning_report = dict(df.attrs.get("cleaning_report", {}))
+        st.success(f"Diametre orbital deduit de l'abaque : {inferred_diameter_m*1000:.1f} mm")
+        with st.expander("Controle qualite automatique de la base"):
+            st.write(
+                "Le classeur contient des pertes ponctuelles de separateur decimal (facteurs x1000). "
+                "Les colonnes redondantes sont reparees avant interpolation; DHP reste la grandeur d'ancrage."
+            )
+            st.json(cleaning_report)
+
         V_target_ms = core.knots_to_ms(float(speed_kn))
         D_target_m = float(diameter_mm) / 1000.0
-        D_ref_m = float(reference_diameter_mm) / 1000.0
+        D_ref_m = float(df.attrs.get("database_orbital_diameter_m", core.DEFAULT_REF_DIAMETER_M))
         min_thrust_v = as_optional_float(min_thrust)
         max_mh_v = as_optional_float(max_mh)
         max_dhp_v = as_optional_float(max_dhp)
@@ -253,6 +277,7 @@ def main() -> None:
         sigma_ref_v = as_optional_float(sigma_ref_text)
         target_blade_length_v = as_optional_float(target_blade_length_text)
         ref_blade_length_v = as_optional_float(reference_blade_length_text)
+        measured_dhp_kw_v = as_optional_float(measured_dhp_kw_text)
 
         if scaling_mode == "2d" and (target_blade_length_v is None or ref_blade_length_v is None):
             st.warning(
@@ -407,6 +432,25 @@ def main() -> None:
             for i, (label, key) in enumerate(metrics):
                 value = result.get(key)
                 cols[i % 3].metric(label, f"{value:.3f}" if value is not None else "NA")
+
+            if result.get("domain_warning"):
+                st.error(
+                    "Attention : " + str(result.get("domain_warning")) + ". "
+                    "Le resultat utilise un voisin de bord et doit etre considere comme une extrapolation."
+                )
+
+            if measured_dhp_kw_v is not None and measured_dhp_kw_v > 0 and ref_blade_length_v:
+                predicted_kw = float(result.get("DHP[W]", float("nan"))) / 1000.0
+                inferred_h = float(ref_blade_length_v) * predicted_kw / measured_dhp_kw_v
+                st.subheader("Calibrage sur le point mesure")
+                ccal1, ccal2, ccal3 = st.columns(3)
+                ccal1.metric("DHP calculee [kW]", f"{predicted_kw:.3f}")
+                ccal2.metric("DHP mesuree [kW]", f"{measured_dhp_kw_v:.3f}")
+                ccal3.metric("Longueur effective deduite [m]", f"{inferred_h:.3f}")
+                st.info(
+                    "Cette longueur est un coefficient de post-traitement effectif. "
+                    "Calibrez-la sur plusieurs points avant de la figer."
+                )
 
             st.subheader("Resultat detaille")
             result_df = pd.DataFrame({"parametre": list(result.keys()), "valeur": list(result.values())})
