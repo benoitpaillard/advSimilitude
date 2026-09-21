@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import argparse
+import io
+import json
+import posixpath
+import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
+from zipfile import ZIP_LZMA, ZipFile
 
 import numpy as np
 import pandas as pd
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
 
 KNOT_TO_MS = 0.514444
@@ -229,8 +235,13 @@ def sanitize_summary_data(data: pd.DataFrame, database_diameter_m: float) -> Dic
         data["eta_Cp[%]"] = -repaired_t * v / power * 100.0
         report["thrust_repaired"] = count
 
+    # Ces grandeurs n'ont pas de redondance et peuvent légitimement passer par zéro : l'heuristique x1000
+    # n'est appliquée que si le classeur présente par ailleurs des pertes de séparateur décimal avérées.
+    workbook_is_corrupted = any(
+        report.get(key, 0) > 0 for key in ["omega_repaired", "rpm_repaired", "eta_repaired", "thrust_repaired"]
+    )
     for col in ["sideforce[N]", "Mh max", "Cd_mean[N.m]"]:
-        report[f"{col}_repaired"] = _repair_v2_scaled_column(data, col)
+        report[f"{col}_repaired"] = _repair_v2_scaled_column(data, col) if workbook_is_corrupted else 0
     return report
 
 
@@ -251,8 +262,7 @@ def _pick_sheet_name(wb, preferred: str) -> str:
     return wb.sheetnames[0]
 
 
-def load_summary(path: str | Path, summary_sheet: str = "Summary") -> pd.DataFrame:
-    """Charge la feuille de synthèse. Si Summary n'existe pas, prend Sheet1 ou la première feuille."""
+def _read_summary_sheet(path: str | Path, summary_sheet: str) -> Tuple[str, pd.DataFrame]:
     wb = load_workbook(filename=path, read_only=True, data_only=True)
     if not wb.sheetnames:
         raise ValueError("Le classeur ne contient aucune feuille.")
@@ -270,7 +280,15 @@ def load_summary(path: str | Path, summary_sheet: str = "Summary") -> pd.DataFra
         headers[0] = "run"
     headers = [str(h).strip() if h is not None else f"col_{i}" for i, h in enumerate(headers)]
 
-    data = pd.DataFrame(rows[1:], columns=headers)
+    return sheet_name, pd.DataFrame(rows[1:], columns=headers)
+
+
+def load_summary(path: str | Path, summary_sheet: str = "Summary") -> pd.DataFrame:
+    """Charge la synthèse d'un classeur xlsx (Summary, sinon Sheet1 ou la première feuille) ou d'une base compacte."""
+    if is_compact_database(path):
+        sheet_name, data = _read_compact_summary(path)
+    else:
+        sheet_name, data = _read_summary_sheet(path, summary_sheet)
     data = data.dropna(how="all").copy()
 
     for col in data.columns:
@@ -390,8 +408,7 @@ def _blade_length_ratio(
     raise ValueError(f"scaling_mode doit être parmi {list(SCALING_MODES)}")
 
 
-def rescale_outputs(
-    base: Dict[str, float],
+def scaling_factors(
     V_target_ms: float,
     V_ref_ms: float,
     D_target_m: float,
@@ -400,13 +417,12 @@ def rescale_outputs(
     target_blade_length_m: Optional[float] = None,
     ref_blade_length_m: Optional[float] = None,
 ) -> Dict[str, float]:
+    """Facteurs de similitude communs aux grandeurs moyennes et aux courbes sur 360°."""
     if scaling_mode not in SCALING_MODES:
         raise ValueError(f"scaling_mode doit être parmi {list(SCALING_MODES)}")
     if V_ref_ms == 0:
         raise ValueError("V_ref_ms ne peut pas être nul.")
-
     exps = SCALING_MODES[scaling_mode]
-    out = dict(base)
     v_ratio = float(V_target_ms / V_ref_ms)
     d_ratio = float(D_target_m / D_ref_m)
     blade_length_ratio = float(
@@ -418,25 +434,57 @@ def rescale_outputs(
             ref_blade_length_m=ref_blade_length_m,
         )
     )
-    h_exp = 1.0 if scaling_mode == "2d" else 0.0
+    h_factor = blade_length_ratio if scaling_mode == "2d" else 1.0
+    return {
+        "v_ratio": v_ratio,
+        "d_ratio": d_ratio,
+        "blade_length_ratio": blade_length_ratio,
+        "force": (v_ratio ** 2.0) * (d_ratio ** exps.force_diam_exp) * h_factor,
+        "moment": (v_ratio ** 2.0) * (d_ratio ** exps.moment_diam_exp) * h_factor,
+        "power": (v_ratio ** 3.0) * (d_ratio ** exps.power_diam_exp) * h_factor,
+    }
 
-    def scale_value(name: str, v_exp: float, d_exp: float, h_exp_local: float) -> float:
+
+def rescale_outputs(
+    base: Dict[str, float],
+    V_target_ms: float,
+    V_ref_ms: float,
+    D_target_m: float,
+    D_ref_m: float,
+    scaling_mode: str = "3d",
+    target_blade_length_m: Optional[float] = None,
+    ref_blade_length_m: Optional[float] = None,
+) -> Dict[str, float]:
+    factors = scaling_factors(
+        V_target_ms=V_target_ms,
+        V_ref_ms=V_ref_ms,
+        D_target_m=D_target_m,
+        D_ref_m=D_ref_m,
+        scaling_mode=scaling_mode,
+        target_blade_length_m=target_blade_length_m,
+        ref_blade_length_m=ref_blade_length_m,
+    )
+    out = dict(base)
+    v_ratio = factors["v_ratio"]
+    d_ratio = factors["d_ratio"]
+    blade_length_ratio = factors["blade_length_ratio"]
+
+    def scale_value(name: str, kind: str) -> float:
         if name not in out or out[name] is None:
             return np.nan
-        factor = (v_ratio ** v_exp) * (d_ratio ** d_exp) * (blade_length_ratio ** h_exp_local)
-        out[name] = float(out[name]) * factor
-        return float(factor)
+        out[name] = float(out[name]) * factors[kind]
+        return float(factors[kind])
 
-    force_factor = scale_value("thrust[N]", 2.0, exps.force_diam_exp, h_exp)
-    scale_value("thrust_propulsive[N]", 2.0, exps.force_diam_exp, h_exp)
-    scale_value("sideforce[N]", 2.0, exps.force_diam_exp, h_exp)
-    scale_value("sideforce_abs[N]", 2.0, exps.force_diam_exp, h_exp)
+    force_factor = scale_value("thrust[N]", "force")
+    scale_value("thrust_propulsive[N]", "force")
+    scale_value("sideforce[N]", "force")
+    scale_value("sideforce_abs[N]", "force")
 
-    moment_factor = scale_value("Mh max", 2.0, exps.moment_diam_exp, h_exp)
-    scale_value("Cp_mean[N.m]", 2.0, exps.moment_diam_exp, h_exp)
-    scale_value("Cd_mean[N.m]", 2.0, exps.moment_diam_exp, h_exp)
+    moment_factor = scale_value("Mh max", "moment")
+    scale_value("Cp_mean[N.m]", "moment")
+    scale_value("Cd_mean[N.m]", "moment")
 
-    power_factor = scale_value("DHP[W]", 3.0, exps.power_diam_exp, h_exp)
+    power_factor = scale_value("DHP[W]", "power")
 
     if "thrust[N]" in out:
         out["thrust_propulsive[N]"] = -float(out["thrust[N]"])
@@ -537,6 +585,456 @@ def evaluate_target_case(
     )
     scaled.update(diagnostics)
     return scaled
+
+
+# ---------------------------------------------------------------------------
+# Base compacte (.npz) : même contenu qu'un classeur outputAll, environ 5 fois plus léger
+# ---------------------------------------------------------------------------
+
+COMPACT_FORMAT = "adv_propulse_compact_database"
+COMPACT_SIGNIFICANT_DIGITS = 6  # précision d'écriture des classeurs outputAll (float_format="%.6g")
+
+
+def is_compact_database(path: str | Path) -> bool:
+    try:
+        with ZipFile(path, "r") as archive:
+            return "meta.npy" in archive.namelist()
+    except Exception:
+        return False
+
+
+def _round_significant(values: np.ndarray, digits: int) -> np.ndarray:
+    safe = np.where(values == 0, 1.0, np.abs(values))
+    mag = 10.0 ** (digits - 1 - np.floor(np.log10(safe)))
+    return np.round(values * mag) / mag
+
+
+def read_compact_metadata(path: str | Path) -> Dict[str, object]:
+    with np.load(path, allow_pickle=False) as archive:
+        meta = json.loads(str(archive["meta"]))
+    if meta.get("format") != COMPACT_FORMAT:
+        raise ValueError(f"'{path}' n'est pas une base compacte ADV Propulse.")
+    return meta
+
+
+def _read_compact_summary(path: str | Path) -> Tuple[str, pd.DataFrame]:
+    meta = read_compact_metadata(path)
+    with np.load(path, allow_pickle=False) as archive:
+        data = pd.DataFrame(archive["summary_values"], columns=[str(c) for c in archive["summary_columns"]])
+        data.insert(0, "run", [str(r) for r in archive["summary_runs"]])
+    return str(meta.get("summary_sheet", "Summary")), data
+
+
+def _read_compact_timeseries(path: str | Path) -> Tuple[List[str], List[str], np.ndarray]:
+    meta = read_compact_metadata(path)
+    with np.load(path, allow_pickle=False) as archive:
+        if "timeseries_values" not in archive.files:
+            raise ValueError("La base compacte ne contient pas les courbes sur 360°.")
+        run_names = [str(r) for r in archive["timeseries_runs"]]
+        columns = [str(c) for c in archive["timeseries_columns"]]
+        stored = archive["timeseries_values"]  # [run, colonne, θ] : les courbes lisses se compressent mieux ainsi
+    values = np.empty((stored.shape[0], stored.shape[2], stored.shape[1]), dtype=float)
+    for i, run in enumerate(stored):  # run par run, pour limiter le pic mémoire
+        values[i] = run.T
+        if stored.dtype == np.float32:
+            # float32 porte 6 chiffres significatifs : l'arrondi restitue exactement les valeurs du classeur.
+            values[i] = _round_significant(values[i], int(meta["significant_digits"]))
+    return run_names, columns, values
+
+
+def export_compact_database(
+    xlsx_path: str | Path,
+    out_path: str | Path,
+    ref_blade_length_m: Optional[float] = None,
+    summary_sheet: str = "Summary",
+) -> Dict[str, object]:
+    """Convertit un classeur outputAll en base compacte, sans perte (vérifié avant écriture)."""
+    sheet_name, raw = _read_summary_sheet(xlsx_path, summary_sheet)
+    raw = raw.dropna(how="all")
+    numeric = raw.drop(columns=["run"]).apply(pd.to_numeric, errors="coerce")
+    arrays: Dict[str, np.ndarray] = {
+        "summary_runs": np.array([str(r) for r in raw["run"]]),
+        "summary_columns": np.array([str(c) for c in numeric.columns]),
+        "summary_values": numeric.to_numpy(dtype=float),
+    }
+    meta: Dict[str, object] = {
+        "format": COMPACT_FORMAT,
+        "version": 1,
+        "source_file": Path(xlsx_path).name,
+        "summary_sheet": sheet_name,
+        "ref_blade_length_m": None if ref_blade_length_m is None else float(ref_blade_length_m),
+        "significant_digits": COMPACT_SIGNIFICANT_DIGITS,
+    }
+    if workbook_has_timeseries(xlsx_path, summary_sheet):
+        run_names, columns, values = load_timeseries(xlsx_path, summary_sheet)
+        stored = np.ascontiguousarray(np.transpose(values, (0, 2, 1)))
+        as_f32 = stored.astype(np.float32)
+        if np.array_equal(_round_significant(as_f32.astype(float), COMPACT_SIGNIFICANT_DIGITS), stored):
+            stored = as_f32
+        meta["timeseries_dtype"] = str(stored.dtype)
+        arrays.update(
+            {
+                "timeseries_runs": np.array(run_names),
+                "timeseries_columns": np.array(columns),
+                "timeseries_values": stored,
+            }
+        )
+    arrays["meta"] = np.array(json.dumps(meta))
+
+    # Archive .npz standard (lisible avec numpy.load), compressée en LZMA plutôt qu'en deflate.
+    with ZipFile(out_path, "w", compression=ZIP_LZMA) as archive:
+        for name, array in arrays.items():
+            with archive.open(f"{name}.npy", "w", force_zip64=True) as handle:
+                np.lib.format.write_array(handle, array, allow_pickle=False)
+    return meta
+
+
+# ---------------------------------------------------------------------------
+# Courbes sur 360° (feuilles run.* du classeur outputAll)
+# ---------------------------------------------------------------------------
+
+SUMMARY_INPUT_COLS = ["Ve [m/s]", "Lambda [-]", "Bmax[°]"]
+TIMESERIES_THETA_COL = "θ (deg.)"
+TIMESERIES_SCALING = {
+    "Fx": "force",
+    "Fy": "force",
+    "FxAll": "force",
+    "FyAll": "force",
+    "Mz": "moment",
+    "Mh": "moment",
+    "SpindleTorque": "moment",
+    "CoupleEffortsTransportes": "moment",
+    "CoupleDirection": "moment",
+    "MzAll": "moment",
+    "SpindleTorqueAll": "moment",
+    "CoupleEffortsTransportesAll": "moment",
+    "CoupleDirectionAll": "moment",
+    "CouplePropulsif": "moment",
+    "DHP": "power",
+}
+# Les autres colonnes (beta, R45, ω50, R54, alpha) sont cinématiques ou angulaires : non mises à l'échelle.
+
+_MAIN_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_HEADER_ROW_RE = re.compile(rb'<row r="1"[^>]*>.*?</row>', re.DOTALL)
+# Cellules numériques (sans attribut t=) des colonnes D et suivantes.
+_NUMERIC_CELL_RE = re.compile(rb'<c r="(?:[D-Z]|[A-Z]{2,})[0-9]+"(?: s="[0-9]+")?><v>([^<]*)</v></c>')
+
+
+def _sheet_paths(archive: ZipFile) -> Dict[str, str]:
+    workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+    rels = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    targets = {rel.attrib["Id"]: rel.attrib["Target"] for rel in rels.findall(f"{{{_PKG_REL_NS}}}Relationship")}
+    result: Dict[str, str] = {}
+    for sheet in workbook.find(f"{{{_MAIN_NS}}}sheets"):
+        target = targets[sheet.attrib[f"{{{_REL_NS}}}id"]]
+        path = target.lstrip("/") if target.startswith("/") else posixpath.normpath(posixpath.join("xl", target))
+        result[sheet.attrib["name"]] = path
+    return result
+
+
+def _timeseries_sheet_names(sheetnames: Iterable[str], summary_sheet: str) -> List[str]:
+    return [name for name in sheetnames if name != summary_sheet and str(name).startswith("run")]
+
+
+def workbook_has_timeseries(path: str | Path, summary_sheet: str = "Summary") -> bool:
+    """Vrai si la base contient les courbes sur 360° (feuilles run.*) en plus de la synthèse."""
+    if is_compact_database(path):
+        with ZipFile(path, "r") as archive:
+            return "timeseries_values.npy" in archive.namelist()
+    with ZipFile(path, "r") as archive:
+        names = list(_sheet_paths(archive))
+    return bool(_timeseries_sheet_names(names, summary_sheet))
+
+
+def _read_timeseries_sheet_openpyxl(ws) -> Tuple[List[str], np.ndarray]:
+    rows = list(ws.iter_rows(values_only=True))
+    header = list(rows[0])
+    first = next(i for i, h in enumerate(header) if h is not None)
+    columns = [str(h).strip() for h in header[first:] if h is not None]
+    values = np.array([list(r[first : first + len(columns)]) for r in rows[1:]], dtype=float)
+    values = values[~np.isnan(values).all(axis=1)]
+    return columns, values
+
+
+def load_timeseries(path: str | Path, summary_sheet: str = "Summary") -> Tuple[List[str], List[str], np.ndarray]:
+    """Charge les feuilles run.* : (noms des runs, colonnes, valeurs[n_runs, n_theta, n_colonnes]).
+
+    Les feuilles sont lues directement dans le XML (rapide). Toute feuille qui ne respecte pas la mise en page
+    attendue est relue avec openpyxl.
+    """
+    if is_compact_database(path):
+        return _read_compact_timeseries(path)
+    wb = load_workbook(filename=path, read_only=True, data_only=True)
+    sheet_name = _pick_sheet_name(wb, summary_sheet)
+    run_names = _timeseries_sheet_names(wb.sheetnames, sheet_name)
+    if not run_names:
+        raise ValueError("Le classeur ne contient aucune feuille run.* avec les courbes sur 360°.")
+
+    columns, first_values = _read_timeseries_sheet_openpyxl(wb[run_names[0]])
+    if TIMESERIES_THETA_COL not in columns:
+        raise ValueError(f"Colonne '{TIMESERIES_THETA_COL}' introuvable dans la feuille '{run_names[0]}'.")
+    n_theta, n_cols = first_values.shape
+    theta_idx = columns.index(TIMESERIES_THETA_COL)
+    theta = first_values[:, theta_idx]
+
+    values = np.empty((len(run_names), n_theta, n_cols), dtype=float)
+    values[0] = first_values
+    with ZipFile(path, "r") as archive:
+        paths = _sheet_paths(archive)
+        ref_header = _HEADER_ROW_RE.search(archive.read(paths[run_names[0]]))
+        for i, name in enumerate(run_names[1:], start=1):
+            data = archive.read(paths[name])
+            sheet_values = None
+            header = _HEADER_ROW_RE.search(data)
+            if ref_header is not None and header is not None and header.group(0) == ref_header.group(0):
+                try:
+                    flat = np.array(_NUMERIC_CELL_RE.findall(data), dtype=float)
+                except ValueError:
+                    flat = np.empty(0)
+                if flat.size == n_theta * n_cols:
+                    candidate = flat.reshape(n_theta, n_cols)
+                    if np.array_equal(candidate[:, theta_idx], theta):
+                        sheet_values = candidate
+            if sheet_values is None:
+                sheet_columns, sheet_values = _read_timeseries_sheet_openpyxl(wb[name])
+                if sheet_columns != columns or sheet_values.shape != (n_theta, n_cols):
+                    raise ValueError(f"La feuille '{name}' n'a pas la même structure que '{run_names[0]}'.")
+                if not np.array_equal(sheet_values[:, theta_idx], theta):
+                    raise ValueError(f"La feuille '{name}' n'a pas les mêmes angles θ que '{run_names[0]}'.")
+            values[i] = sheet_values
+    return run_names, columns, values
+
+
+class TimeSeriesSurrogate:
+    """Interpole les courbes sur 360° sur (V, lambda, Bmax), avec le même schéma que Surrogate3D.
+
+    L'interpolation est faite à θ fixé : la cinématique étant calée sur θ, les courbes des runs voisins
+    sont en phase. La moyenne des courbes interpolées redonne donc les grandeurs moyennes interpolées.
+    """
+
+    def __init__(self, df: pd.DataFrame, run_names: List[str], columns: List[str], values: np.ndarray) -> None:
+        if "run" not in df.columns:
+            raise ValueError("La feuille de synthèse ne contient pas le nom des runs.")
+        position = {name: i for i, name in enumerate(run_names)}
+        matched = df[df["run"].isin(position)]
+        if len(matched) < 5:
+            raise ValueError("Les feuilles run.* ne correspondent pas aux lignes de la feuille de synthèse.")
+        self.columns = list(columns)
+        self.n_theta = int(values.shape[1])
+        self.n_runs = int(len(matched))
+        self.missing_runs = [str(r) for r in df["run"] if r not in position]
+        self.summary = matched.reset_index(drop=True)
+
+        pts = matched[SUMMARY_INPUT_COLS].to_numpy(dtype=float)
+        vals = values[[position[r] for r in matched["run"]]]
+        flat = vals.reshape(len(matched), -1)
+        self._linear = LinearNDInterpolator(pts, flat, fill_value=np.nan)
+        self._nearest = NearestNDInterpolator(pts, flat)
+        self.consistency_report = self._check_against_summary(matched, vals)
+
+    def _check_against_summary(self, matched: pd.DataFrame, vals: np.ndarray) -> Dict[str, int]:
+        """Compte les runs dont la synthèse n'est pas la moyenne (ou le max) de leurs courbes."""
+        checks = {
+            "thrust[N]": ("FxAll", lambda a: a.mean(axis=1)),
+            "sideforce[N]": ("FyAll", lambda a: a.mean(axis=1)),
+            "DHP[W]": ("DHP", lambda a: a.mean(axis=1)),
+            "Mh max": ("Mh", lambda a: np.abs(a).max(axis=1)),
+        }
+        report: Dict[str, int] = {}
+        for summary_col, (ts_col, reducer) in checks.items():
+            if summary_col not in matched.columns or ts_col not in self.columns:
+                continue
+            expected = matched[summary_col].to_numpy(dtype=float)
+            got = reducer(vals[:, :, self.columns.index(ts_col)])
+            scale = max(float(np.nanmax(np.abs(expected))), 1e-12)
+            bad = ~np.isclose(got, expected, rtol=1e-3, atol=1e-6 * scale)
+            report[f"{summary_col}_incoherent_avec_courbes"] = int(bad.sum())
+        return report
+
+    def __call__(self, V_ms: float, lam: float, bmax_deg: float) -> Tuple[pd.DataFrame, bool]:
+        p = np.array([[float(V_ms), float(lam), float(bmax_deg)]], dtype=float)
+        flat = np.asarray(self._linear(p))[0]
+        used_nearest = bool(np.isnan(flat).any())
+        if used_nearest:
+            flat = np.asarray(self._nearest(p))[0]
+        return pd.DataFrame(flat.reshape(self.n_theta, len(self.columns)), columns=self.columns), used_nearest
+
+
+def build_timeseries_surrogate(path: str | Path, df: pd.DataFrame, summary_sheet: str = "Summary") -> TimeSeriesSurrogate:
+    run_names, columns, values = load_timeseries(path, summary_sheet=summary_sheet)
+    return TimeSeriesSurrogate(df, run_names, columns, values)
+
+
+def evaluate_target_timeseries(ts_surrogate: TimeSeriesSurrogate, point: Dict[str, float]) -> Tuple[pd.DataFrame, bool]:
+    """Courbes sur 360° du cas cible, pour un point issu de evaluate_target_case (mêmes facteurs de similitude)."""
+    curves, used_nearest = ts_surrogate(
+        float(point["V_reference_in_database_ms"]), float(point["lambda"]), float(point["Bmax_deg"])
+    )
+    h_target = point.get("target_blade_length_m")
+    h_ref = point.get("ref_blade_length_m")
+    factors = scaling_factors(
+        V_target_ms=float(point["V_target_ms"]),
+        V_ref_ms=float(point["V_reference_in_database_ms"]),
+        D_target_m=float(point["D_target_m"]),
+        D_ref_m=float(point["D_ref_m"]),
+        scaling_mode=str(point["scaling_mode"]),
+        target_blade_length_m=None if h_target is None or not np.isfinite(h_target) else float(h_target),
+        ref_blade_length_m=None if h_ref is None or not np.isfinite(h_ref) else float(h_ref),
+    )
+    for col, kind in TIMESERIES_SCALING.items():
+        if col in curves.columns:
+            curves[col] = curves[col] * factors[kind]
+    # Un angle ne s'interpole pas linéairement au passage ±180° : alpha est recalculé depuis Fx, Fy.
+    if {"Fx", "Fy", "alpha"}.issubset(curves.columns):
+        curves["alpha"] = np.degrees(np.arctan2(curves["Fy"], curves["Fx"]))
+    return curves, used_nearest
+
+
+def summarize_timeseries(curves: pd.DataFrame, point: Dict[str, float], reference_row: Optional[pd.Series] = None) -> Dict[str, float]:
+    """Ligne de synthèse au format outputAll, recalculée à partir des courbes du cas cible."""
+    summary: Dict[str, float] = {}
+    if reference_row is not None:
+        for col in reference_row.index:
+            if col in ("run", "thrust_propulsive[N]", "sideforce_abs[N]"):
+                continue
+            summary[col] = point.get(col, reference_row[col])
+    V = float(point["V_target_ms"])
+    summary.update(
+        {
+            "Ve [m/s]": V,
+            "Lambda [-]": float(point["lambda"]),
+            "Bmax[°]": float(point["Bmax_deg"]),
+            "omega [rad/s]": float(point["omega_target_rad_s"]),
+            "omega [rpm]": float(point["omega_target_rpm"]),
+        }
+    )
+    means = {
+        "thrust[N]": "FxAll",
+        "sideforce[N]": "FyAll",
+        "alpha_FxFy_deg": "alpha",
+        "Cp_mean[N.m]": "CouplePropulsif",
+        "Cd_mean[N.m]": "CoupleDirectionAll",
+        "DHP[W]": "DHP",
+    }
+    for summary_col, ts_col in means.items():
+        if ts_col in curves.columns:
+            summary[summary_col] = float(curves[ts_col].mean())
+    if "Mh" in curves.columns:
+        summary["Mh max"] = float(curves["Mh"].abs().max())
+    # eta reste celui de l'abaque (interpolé directement), comme dans le reste de l'outil.
+    if "eta_Cp[%]" not in point and summary.get("DHP[W]"):
+        summary["eta_Cp[%]"] = -summary["thrust[N]"] * V / summary["DHP[W]"] * 100.0
+    return summary
+
+
+def critical_blade_loads(
+    curves: pd.DataFrame,
+    Mh_ref_Nm: Optional[float] = None,
+    Fh_ref_N: Optional[float] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Efforts simultanés sur une pale au cours du tour et cas critiques.
+
+    Fh = sqrt(Fx² + Fy²) est l'effort résultant sur une pale. L'indice combiné vaut |Mh|/Mh_ref + Fh/Fh_ref,
+    avec pour références les valeurs admissibles si elles sont fournies, sinon les maxima sur le tour
+    (l'indice vaut alors 2 si les deux maxima sont atteints au même angle).
+    """
+    missing = [c for c in ["Fx", "Fy", "Mh"] if c not in curves.columns]
+    if missing:
+        raise ValueError(f"Colonnes manquantes pour l'analyse des efforts de pale : {missing}")
+    loads = pd.DataFrame({"theta_deg": curves[TIMESERIES_THETA_COL]})
+    if "beta" in curves.columns:
+        loads["beta_deg"] = curves["beta"]
+    loads["Fx_N"] = curves["Fx"]
+    loads["Fy_N"] = curves["Fy"]
+    loads["Fh_N"] = np.hypot(curves["Fx"], curves["Fy"])
+    loads["alpha_Fh_deg"] = np.degrees(np.arctan2(curves["Fy"], curves["Fx"]))
+    loads["Mh_Nm"] = curves["Mh"]
+
+    mh_ref = float(Mh_ref_Nm) if Mh_ref_Nm else float(loads["Mh_Nm"].abs().max())
+    fh_ref = float(Fh_ref_N) if Fh_ref_N else float(loads["Fh_N"].max())
+    loads["Mh_sur_ref"] = loads["Mh_Nm"].abs() / mh_ref if mh_ref > 0 else 0.0
+    loads["Fh_sur_ref"] = loads["Fh_N"] / fh_ref if fh_ref > 0 else 0.0
+    loads["indice_combine"] = loads["Mh_sur_ref"] + loads["Fh_sur_ref"]
+
+    picks = [
+        ("Mh maximal (positif)", int(loads["Mh_Nm"].idxmax())),
+        ("Mh minimal (negatif)", int(loads["Mh_Nm"].idxmin())),
+        ("Fh maximal", int(loads["Fh_N"].idxmax())),
+        ("Pire combinaison |Mh|/Mh_ref + Fh/Fh_ref", int(loads["indice_combine"].idxmax())),
+    ]
+    cases = pd.DataFrame([{"cas": label, **loads.loc[idx].to_dict()} for label, idx in picks])
+    cases.attrs["Mh_ref_Nm"] = mh_ref
+    cases.attrs["Fh_ref_N"] = fh_ref
+    cases.attrs["refs_are_allowables"] = bool(Mh_ref_Nm) and bool(Fh_ref_N)
+    return loads, cases
+
+
+def _excel_value(value):
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        x = float(value)
+        if not np.isfinite(x):
+            return None
+        return float(f"{x:.6g}")  # même précision que les fichiers de simulation
+    return None if value is None else str(value)
+
+
+def build_simulation_workbook(
+    point: Dict[str, float],
+    curves: pd.DataFrame,
+    summary: Dict[str, float],
+    loads: Optional[pd.DataFrame] = None,
+    cases: Optional[pd.DataFrame] = None,
+    run_name: str = "run.interp",
+) -> bytes:
+    """Classeur au format outputAll (Summary + feuille de run sur 360°) pour le cas cible interpolé."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Summary"
+    labels = list(summary)
+    ws.append([None] + labels)
+    ws.append([run_name] + [_excel_value(summary[k]) for k in labels])
+
+    # Même mise en page qu'une feuille run.* standard : synthèse en colonnes A-B, courbes à partir de D.
+    ws_run = wb.create_sheet(run_name)
+    for j, col in enumerate(curves.columns):
+        ws_run.cell(row=1, column=4 + j, value=col)
+    for i, row in enumerate(curves.itertuples(index=False), start=2):
+        for j, value in enumerate(row):
+            ws_run.cell(row=i, column=4 + j, value=_excel_value(value))
+    ws_run.cell(row=3, column=2, value=run_name)
+    for i, label in enumerate(labels, start=4):
+        ws_run.cell(row=i, column=1, value=label)
+        ws_run.cell(row=i, column=2, value=_excel_value(summary[label]))
+
+    if loads is not None and cases is not None:
+        ws_crit = wb.create_sheet("Efforts pale")
+        ws_crit.append(["Mh_ref [N.m]", _excel_value(cases.attrs.get("Mh_ref_Nm"))])
+        ws_crit.append(["Fh_ref [N]", _excel_value(cases.attrs.get("Fh_ref_N"))])
+        ws_crit.append(
+            ["References", "valeurs admissibles" if cases.attrs.get("refs_are_allowables") else "maxima sur le tour (sauf valeur admissible fournie)"]
+        )
+        ws_crit.append([])
+        ws_crit.append(list(cases.columns))
+        for row in cases.itertuples(index=False):
+            ws_crit.append([_excel_value(v) for v in row])
+        ws_crit.append([])
+        ws_crit.append(list(loads.columns))
+        for row in loads.itertuples(index=False):
+            ws_crit.append([_excel_value(v) for v in row])
+
+    ws_info = wb.create_sheet("Interpolation")
+    ws_info.append(["parametre", "valeur"])
+    ws_info.append(["origine", "Courbes interpolees dans la base CFD puis mises a l'echelle : ce n'est pas un calcul CFD."])
+    for key, value in point.items():
+        ws_info.append([key, _excel_value(value)])
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
 
 
 def _apply_constraints(

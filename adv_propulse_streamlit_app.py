@@ -1,21 +1,40 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
 APP_TITLE = "ADV Propulse - Application navigateur"
 CORE_SCRIPT_NAME = "adv_propulse_scaling_optimizer.py"
 BUNDLED_DATA_CANDIDATES = [
+    "adv_propulse_database_Lpale0.375m.npz",
+    "outputAll_Lpale0.375m.xlsx",
     "adv_propulse_database.xlsx",
     "tab.xlsx",
     "outputAll.xlsx",
 ]
+
+
+# Envergure de pale avec laquelle chaque base connue a ete post-traitee [m].
+KNOWN_REFERENCE_BLADE_LENGTHS_M = {"adv_propulse_database.xlsx": 5.0}
+FALLBACK_REFERENCE_BLADE_LENGTH_M = 5.0
+
+
+def reference_blade_length_for(filename: str) -> Tuple[float, bool]:
+    """Envergure de post-traitement de la base, lue dans le nom du fichier (…_Lpale0.375m.*) si possible."""
+    match = re.search(r"Lpale([0-9]+(?:[.,][0-9]+)?)m", filename)
+    if match:
+        return float(match.group(1).replace(",", ".")), True
+    if filename in KNOWN_REFERENCE_BLADE_LENGTHS_M:
+        return KNOWN_REFERENCE_BLADE_LENGTHS_M[filename], True
+    return FALLBACK_REFERENCE_BLADE_LENGTH_M, False
 
 
 def resource_path(filename: str) -> Path:
@@ -28,7 +47,7 @@ def discover_bundled_workbook() -> Optional[Path]:
         path = root / name
         if path.exists():
             return path
-    matches = sorted(root.glob("*.xlsx"))
+    matches = sorted(root.glob("*.npz")) + sorted(root.glob("*.xlsx"))
     return matches[0] if matches else None
 
 
@@ -77,6 +96,138 @@ def build_surrogate_from_path(path_str: str):
     _, df = load_summary_from_path(path_str)
     surrogate = core.build_surrogate(df)
     return path_str, df, surrogate
+
+
+@st.cache_resource(show_spinner=False, max_entries=2)
+def build_timeseries_surrogate_from_bytes(file_bytes: bytes):
+    core = load_core_module()
+    tmp_path, df = load_summary_from_bytes(file_bytes)
+    if not core.workbook_has_timeseries(tmp_path):
+        return None
+    return core.build_timeseries_surrogate(tmp_path, df)
+
+
+@st.cache_resource(show_spinner=False, max_entries=2)
+def build_timeseries_surrogate_from_path(path_str: str):
+    core = load_core_module()
+    _, df = load_summary_from_path(path_str)
+    if not core.workbook_has_timeseries(path_str):
+        return None
+    return core.build_timeseries_surrogate(path_str, df)
+
+
+SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a"]
+
+
+def _theta_axis() -> alt.X:
+    return alt.X("theta_deg:Q", title="θ [deg]", scale=alt.Scale(domain=[0, 360], nice=False), axis=alt.Axis(values=list(range(0, 361, 45))))
+
+
+def _theta_line_chart(data: pd.DataFrame, y_title: str, critical_thetas) -> alt.LayerChart:
+    """Courbes en fonction de θ (une seule unité par graphique), avec repères aux angles critiques."""
+    series = list(data["grandeur"].unique())
+    lines = (
+        alt.Chart(data)
+        .mark_line(strokeWidth=2)
+        .encode(
+            x=_theta_axis(),
+            y=alt.Y("valeur:Q", title=y_title),
+            color=alt.Color(
+                "grandeur:N",
+                scale=alt.Scale(domain=series, range=SERIES_COLORS[: len(series)]),
+                legend=alt.Legend(title=None, orient="top") if len(series) > 1 else None,
+            ),
+            tooltip=[alt.Tooltip("theta_deg:Q", title="θ [deg]"), "grandeur:N", alt.Tooltip("valeur:Q", format=".4g")],
+        )
+    )
+    rules = (
+        alt.Chart(pd.DataFrame({"theta_deg": sorted(set(critical_thetas))}))
+        .mark_rule(strokeDash=[4, 4], opacity=0.6, color="#8a8a86")
+        .encode(x="theta_deg:Q")
+    )
+    return (rules + lines).properties(height=260).interactive(bind_y=False)
+
+
+def render_timeseries_section(core, ts_surrogate, point: Dict[str, Any], mh_adm: Optional[float], fh_adm: Optional[float]) -> None:
+    st.subheader("Simulation interpolee sur 360°")
+    curves, used_nearest = core.evaluate_target_timeseries(ts_surrogate, point)
+    reference_row = ts_surrogate.summary.iloc[0]
+    summary = core.summarize_timeseries(curves, point, reference_row)
+    loads, cases = core.critical_blade_loads(curves, Mh_ref_Nm=mh_adm, Fh_ref_N=fh_adm)
+
+    st.caption(
+        "Toutes les colonnes d'une feuille de simulation standard sont interpolees a θ fixe entre les runs voisins "
+        "de la base, puis mises a l'echelle avec les memes facteurs que les grandeurs moyennes. "
+        "Ce n'est pas un calcul CFD : les pics peuvent etre legerement lisses entre deux runs."
+    )
+    if used_nearest or point.get("domain_warning"):
+        st.error("Point hors du domaine de la base : les courbes sont celles du run le plus proche (extrapolation).")
+
+    st.markdown("**Cas critiques pour une pale** (Mh et efforts Fx/Fy simultanes, Fh = √(Fx² + Fy²))")
+    st.dataframe(cases.round(4), width="stretch", hide_index=True)
+    mh_ref = cases.attrs["Mh_ref_Nm"]
+    fh_ref = cases.attrs["Fh_ref_N"]
+    st.caption(
+        f"Indice combine = |Mh|/Mh_ref + Fh/Fh_ref avec Mh_ref = {mh_ref:.4g} N.m "
+        f"({'admissible' if mh_adm else 'max sur le tour'}) et Fh_ref = {fh_ref:.4g} N "
+        f"({'admissible' if fh_adm else 'max sur le tour'}). "
+        "Sans valeurs admissibles, l'indice vaut 2 quand les deux maxima sont atteints au meme angle."
+    )
+
+    critical_thetas = cases["theta_deg"].tolist()
+    mh_data = loads[["theta_deg", "Mh_Nm"]].rename(columns={"Mh_Nm": "valeur"}).assign(grandeur="Mh")
+    force_data = loads[["theta_deg", "Fh_N", "Fx_N", "Fy_N"]].rename(columns={"Fh_N": "Fh", "Fx_N": "Fx", "Fy_N": "Fy"})
+    force_data = force_data.melt("theta_deg", var_name="grandeur", value_name="valeur")
+    left, right = st.columns(2)
+    with left:
+        st.markdown("Mh sur une pale [N.m]")
+        st.altair_chart(_theta_line_chart(mh_data, "Mh [N.m]", critical_thetas), width="stretch")
+    with right:
+        st.markdown("Efforts sur une pale [N]")
+        st.altair_chart(_theta_line_chart(force_data, "Effort [N]", critical_thetas), width="stretch")
+
+    st.markdown("Combinaisons (Fh, Mh) parcourues sur le tour, avec les cas critiques")
+    envelope = (
+        alt.Chart(loads)
+        .mark_line(strokeWidth=2, color=SERIES_COLORS[0])
+        .encode(
+            x=alt.X("Fh_N:Q", title="Fh [N]"),
+            y=alt.Y("Mh_Nm:Q", title="Mh [N.m]"),
+            order="theta_deg:Q",
+            tooltip=[alt.Tooltip("theta_deg:Q", title="θ [deg]"), alt.Tooltip("Fh_N:Q", format=".4g"), alt.Tooltip("Mh_Nm:Q", format=".4g")],
+        )
+    )
+    unique_cases = cases.drop_duplicates("theta_deg")
+    markers = (
+        alt.Chart(unique_cases)
+        .mark_point(size=90, filled=True, color="#0b0b0b", stroke="#fcfcfb", strokeWidth=2, opacity=1)
+        .encode(x="Fh_N:Q", y="Mh_Nm:Q", tooltip=["cas:N", alt.Tooltip("theta_deg:Q", title="θ [deg]")])
+    )
+    labels = (
+        alt.Chart(unique_cases.assign(etiquette=unique_cases["theta_deg"].map(lambda t: f"θ = {t:.0f}°")))
+        .mark_text(align="right", dx=-10, dy=-8)
+        .encode(x="Fh_N:Q", y="Mh_Nm:Q", text="etiquette:N")
+    )
+    st.altair_chart((envelope + markers + labels).properties(height=320), width="stretch")
+
+    with st.expander("Courbes completes sur 360° (format feuille de simulation)"):
+        st.dataframe(curves, width="stretch", hide_index=True)
+
+    workbook_bytes = core.build_simulation_workbook(point, curves, summary, loads, cases)
+    stub = f"D{point['D_target_m'] * 1000:.0f}mm_{point['V_target_kn']:.1f}kn_L{point['lambda']:.2f}_B{point['Bmax_deg']:.1f}"
+    st.download_button(
+        "Telecharger la simulation interpolee (xlsx, format outputAll)",
+        data=workbook_bytes,
+        file_name=f"simu_interpolee_{stub}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+    )
+    st.download_button(
+        "Telecharger les efforts de pale sur 360° en CSV",
+        data=dataframe_to_download_bytes(loads),
+        file_name=f"efforts_pale_{stub}.csv",
+        mime="text/csv",
+    )
 
 
 def dataframe_to_download_bytes(df: pd.DataFrame) -> bytes:
@@ -148,9 +299,12 @@ def main() -> None:
             st.warning("Aucune base bundlee detectee dans le dossier de l'application.")
 
         uploaded = st.file_uploader(
-            "Remplacer la base bundlee par un autre fichier Excel (.xlsx)",
-            type=["xlsx"],
-            help="Optionnel. Si vous ne chargez rien ici, l'application utilisera automatiquement la base bundlee.",
+            "Remplacer la base bundlee par un autre classeur (.xlsx) ou une base compacte (.npz)",
+            type=["xlsx", "npz"],
+            help=(
+                "Optionnel. Si vous ne chargez rien ici, l'application utilisera automatiquement la base bundlee. "
+                "Un classeur outputAll complet (feuilles run.*) active aussi la simulation sur 360°."
+            ),
         )
 
         st.header("Entrees")
@@ -205,11 +359,34 @@ def main() -> None:
                 "2d = correction explicite par longueur de pale H_target/H_ref."
             ),
         )
+        base_name = uploaded.name if uploaded is not None else (bundled_workbook.name if bundled_workbook else "")
+        ref_length_default, ref_length_known = reference_blade_length_for(base_name)
         target_blade_length_text = st.text_input("Longueur de pale cible [m] (utilisee en 2d)", value="")
         reference_blade_length_text = st.text_input(
-            "Longueur de pale effective utilisee au post-traitement de la base [m]", value="5.00",
-            help="Valeur calibree provisoirement autour de 5 m sur les cas P200, P75.6 et le point de bollard-pull. A remplacer si la valeur originale est retrouvee."
+            "Longueur de pale effective utilisee au post-traitement de la base [m]",
+            value=f"{ref_length_default:g}",
+            help=(
+                "Envergure de pale par laquelle les resultats CFD 2D (par metre) ont ete multiplies pour construire "
+                "le classeur utilise. En mode 2d, les sorties sont multipliees par H_cible / cette valeur. "
+                "Elle est pre-remplie d'apres le nom du fichier (…_Lpale0.375m -> 0.375 m) ; "
+                "l'ancienne base adv_propulse_database.xlsx utilise 5 m (valeur calibree)."
+            ),
         )
+        if not ref_length_known:
+            st.warning(
+                "Envergure de post-traitement inconnue pour ce classeur : verifiez la valeur ci-dessus "
+                "(elle n'a pas pu etre lue dans le nom du fichier)."
+            )
+
+        st.markdown("---")
+        st.subheader("Simulation sur 360°")
+        want_timeseries = st.checkbox(
+            "Generer la simulation interpolee sur 360°",
+            value=True,
+            help="Necessite un classeur outputAll complet (feuilles run.*). Le premier chargement prend quelques dizaines de secondes.",
+        )
+        mh_adm_text = st.text_input("Mh admissible pale [N.m] (optionnel)", value="")
+        fh_adm_text = st.text_input("Effort admissible pale Fh [N] (optionnel)", value="")
 
         st.markdown("---")
         if mode == "Optimisation":
@@ -233,7 +410,7 @@ def main() -> None:
             )
             min_thrust = max_mh = max_dhp = ""
 
-        run = st.button("Lancer", type="primary", use_container_width=True)
+        run = st.button("Lancer", type="primary", width="stretch")
 
     if uploaded is not None:
         source_label = uploaded.name
@@ -247,7 +424,10 @@ def main() -> None:
 
     st.info(f"Base utilisee : {source_label}")
 
-    if not run:
+    # Un clic sur un bouton de telechargement relance le script : on garde les resultats affiches.
+    if run:
+        st.session_state["has_run"] = True
+    if not st.session_state.get("has_run"):
         st.stop()
 
     with st.spinner("Chargement de la base et calcul..."):
@@ -278,6 +458,25 @@ def main() -> None:
         target_blade_length_v = as_optional_float(target_blade_length_text)
         ref_blade_length_v = as_optional_float(reference_blade_length_text)
         measured_dhp_kw_v = as_optional_float(measured_dhp_kw_text)
+        mh_adm_v = as_optional_float(mh_adm_text)
+        fh_adm_v = as_optional_float(fh_adm_text)
+
+        ts_surrogate = None
+        if want_timeseries:
+            if source_kind == "uploaded":
+                ts_surrogate = build_timeseries_surrogate_from_bytes(uploaded.getvalue())
+            else:
+                ts_surrogate = build_timeseries_surrogate_from_path(str(bundled_workbook))
+            if ts_surrogate is None:
+                st.info(
+                    "Simulation sur 360° indisponible : la base utilisee ne contient que la synthese. "
+                    "Chargez un classeur outputAll complet (feuilles run.*) pour l'activer."
+                )
+            elif any(ts_surrogate.consistency_report.values()) or ts_surrogate.missing_runs:
+                st.warning(
+                    f"Courbes 360° : incoherences avec la synthese {ts_surrogate.consistency_report}, "
+                    f"runs sans feuille : {len(ts_surrogate.missing_runs)}."
+                )
 
         if scaling_mode == "2d" and (target_blade_length_v is None or ref_blade_length_v is None):
             st.warning(
@@ -376,11 +575,11 @@ def main() -> None:
                 "domain_warning",
                 "_used_nearest_fallback",
             ]
-            meta_df = pd.DataFrame({"parametre": meta_cols, "valeur": [best.get(c) for c in meta_cols]})
-            st.dataframe(meta_df, use_container_width=True, hide_index=True)
+            meta_df = pd.DataFrame({"parametre": meta_cols, "valeur": [str(best.get(c)) for c in meta_cols]})
+            st.dataframe(meta_df, width="stretch", hide_index=True)
 
             st.subheader("Loi discrete Bmax_opt(lambda) coherente avec le cas cible")
-            st.dataframe(law, use_container_width=True, hide_index=True)
+            st.dataframe(law, width="stretch", hide_index=True)
             st.download_button(
                 "Telecharger la loi discrete en CSV",
                 data=dataframe_to_download_bytes(law),
@@ -389,7 +588,7 @@ def main() -> None:
             )
 
             st.subheader("Enveloppe brute de la base CFD")
-            st.dataframe(raw_env, use_container_width=True, hide_index=True)
+            st.dataframe(raw_env, width="stretch", hide_index=True)
             st.download_button(
                 "Telecharger l'enveloppe brute en CSV",
                 data=dataframe_to_download_bytes(raw_env),
@@ -398,13 +597,18 @@ def main() -> None:
             )
 
             st.subheader("Top 10 faisables")
-            st.dataframe(top10, use_container_width=True, hide_index=True)
+            st.dataframe(top10, width="stretch", hide_index=True)
             st.download_button(
                 "Telecharger le top 10 en CSV",
                 data=dataframe_to_download_bytes(top10),
                 file_name="top10_feasible.csv",
                 mime="text/csv",
             )
+
+            if ts_surrogate is not None:
+                st.markdown("---")
+                st.caption("Courbes sur 360° du meilleur point ci-dessus.")
+                render_timeseries_section(core, ts_surrogate, best, mh_adm_v, fh_adm_v)
 
             txt = report_text(best, law, raw_env, top10)
             st.download_button(
@@ -453,8 +657,11 @@ def main() -> None:
                 )
 
             st.subheader("Resultat detaille")
-            result_df = pd.DataFrame({"parametre": list(result.keys()), "valeur": list(result.values())})
-            st.dataframe(result_df, use_container_width=True, hide_index=True)
+            result_df = pd.DataFrame({"parametre": list(result.keys()), "valeur": [str(v) for v in result.values()]})
+            st.dataframe(result_df, width="stretch", hide_index=True)
+
+            if ts_surrogate is not None:
+                render_timeseries_section(core, ts_surrogate, result, mh_adm_v, fh_adm_v)
 
             txt = report_text(result, None, None, None)
             st.download_button(
