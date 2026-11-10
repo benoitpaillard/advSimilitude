@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional, Tuple
 import altair as alt
 import pandas as pd
 import streamlit as st
+from campaign_variants import VARIANTS, CampaignSurrogate, load_campaign
 
 APP_TITLE = "ADV Propulse - Application navigateur"
 CORE_SCRIPT_NAME = "adv_propulse_scaling_optimizer.py"
@@ -114,6 +115,25 @@ def build_timeseries_surrogate_from_path(path_str: str):
     if not core.workbook_has_timeseries(path_str):
         return None
     return core.build_timeseries_surrogate(path_str, df)
+
+
+@st.cache_data(show_spinner=False)
+def campaign_data():
+    return load_campaign()
+
+
+@st.cache_resource(show_spinner=False, max_entries=3)
+def build_campaign_surrogate(path_str: str, variant: str):
+    _, df, reference = build_surrogate_from_path(path_str)
+    runs, _ = campaign_data()
+    return CampaignSurrogate(reference, df, variant, runs)
+
+
+def render_campaign_quality(point):
+    if point.get('campaign_variant'):
+        st.info(f"Qualité : {point['campaign_quality']}" + (f" — {point['campaign_run']}" if point.get('campaign_run') else ''))
+        if point.get('campaign_warning'):
+            st.warning(point['campaign_warning'])
 
 
 SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a"]
@@ -244,6 +264,8 @@ def as_optional_float(value: str):
 def report_text(best: Dict[str, Any], law: pd.DataFrame | None, raw_env: pd.DataFrame | None, top10: pd.DataFrame | None) -> str:
     lines = ["=== Meilleur point ==="]
     for k in [
+        'campaign_variant', 'campaign_quality', 'campaign_run', 'campaign_supported', 'campaign_warning',
+        'sigma[°]', 'DIR[°]',
         "lambda",
         "Bmax_deg",
         "eta_Cp[%]",
@@ -307,6 +329,15 @@ def main() -> None:
             ),
         )
 
+        campaign_available = uploaded is None and bundled_workbook is not None and bundled_workbook.name == 'adv_propulse_database_Lpale0.375m.npz'
+        variant = st.selectbox(
+            'Configuration CFD', list(VARIANTS) if campaign_available else ['reference'],
+            format_func=lambda name: VARIANTS[name][0],
+            help='Les variantes utilisent uniquement les cas convergés de la campagne d’octobre–novembre 2026. Disponibles avec la base intégrée.',
+        )
+        if variant != 'reference':
+            st.caption('Corrections de synthèse interpolées ; les points rejetés et le hors-domaine sont exclus de l’optimisation.')
+
         st.header("Entrees")
         mode = st.radio("Mode", ["Optimisation", "Evaluation d'un point"], index=0)
         diameter_mm = st.number_input("Diametre cible [mm]", min_value=1.0, value=200.0, step=10.0)
@@ -345,7 +376,8 @@ def main() -> None:
                 chord_ratio_text = st.text_input("Rapport de corde c_cible / c_ref", value="")
             elif reynolds_mode == "sigma":
                 sigma_target_text = st.text_input("Sigma cible [-]", value="")
-                sigma_ref_text = st.text_input("Sigma ref [-]", value="")
+                sigma_ref_text = st.text_input("Sigma ref [-]", value=str(VARIANTS[variant][1]),
+                                              help='Ce champ sert à la correction iso-Reynolds. La configuration CFD est choisie séparément ci-dessus.')
                 blades_target = st.number_input("Nombre de pales cible", min_value=1.0, value=3.0, step=1.0)
                 blades_ref = st.number_input("Nombre de pales ref", min_value=1.0, value=3.0, step=1.0)
 
@@ -382,9 +414,12 @@ def main() -> None:
         st.subheader("Simulation sur 360°")
         want_timeseries = st.checkbox(
             "Generer la simulation interpolee sur 360°",
-            value=True,
+            value=variant == 'reference',
+            disabled=variant != 'reference',
             help="Necessite un classeur outputAll complet (feuilles run.*). Le premier chargement prend quelques dizaines de secondes.",
         )
+        if variant != 'reference':
+            st.caption('Courbes 360° indisponibles pour ces variantes : les synthèses ne permettent pas de reconstruire les efforts simultanés sur une pale.')
         mh_adm_text = st.text_input("Mh admissible pale [N.m] (optionnel)", value="")
         fh_adm_text = st.text_input("Effort admissible pale Fh [N] (optionnel)", value="")
 
@@ -423,6 +458,21 @@ def main() -> None:
         return
 
     st.info(f"Base utilisee : {source_label}")
+    if campaign_available:
+        campaign_runs, campaign_meta = campaign_data()
+        with st.expander('Campagne CFD — résultats et limites de validité (10 novembre 2026)'):
+            counts = campaign_runs.groupby('variant').agg(calculés=('run','size'), convergés=('converged','sum'))
+            st.dataframe(counts, width='stretch')
+            st.write('1 705 cas uniques ; 1 301 avec convergence périodique ; 404 sans ce marqueur. Quatre anomalies manifestes sont exclues. Le contrôle porte sur Mz entre deux tours et ne valide pas tous les pics ni le maillage.')
+            comparison = pd.DataFrame({
+                'Variante':['DIR=+2°','σ=1,7','Combinaison'],
+                'Poussée (%)':[-9.8,6.3,-6.4], 'DHP (%)':[-10.5,6.5,-6.7],
+                'Rendement relatif (%)':[1.2,-1.0,-0.1], 'Mh max (%)':[11.0,32.7,48.2],
+            })
+            st.caption('Écarts médians à la référence, sur 219 points communs convergés ; mêmes V, lambda et Bmax. Ils ne constituent pas une comparaison à poussée imposée.')
+            st.dataframe(comparison, width='stretch', hide_index=True)
+            st.write('Contrôle V=10 → 30 m/s : erreurs médianes poussée/DHP de 1,03/0,73 % pour σ=1,7 (10 couples), et 2,45/2,10 % pour la combinaison (9 couples). Convergence exigée aux deux vitesses ; ces écarts ne sont pas des bornes d’erreur sur tout le domaine.')
+            st.warning('Le pilote reproduit poussée et DHP à moins de 1 %, mais Mh max diffère de 20 %. Les pics mécaniques demandent une validation séparée. Les contrôles à 30 m/s ne valident pas lambda=0,5 ni lambda=1,7 avec Bmax=25°.')
 
     # Un clic sur un bouton de telechargement relance le script : on garde les resultats affiches.
     if run:
@@ -435,6 +485,9 @@ def main() -> None:
             _, df, surrogate = build_surrogate_from_bytes(uploaded.getvalue())
         else:
             _, df, surrogate = build_surrogate_from_path(str(bundled_workbook))
+        if variant != 'reference':
+            surrogate = build_campaign_surrogate(str(bundled_workbook), variant)
+            st.info(f"Configuration : {VARIANTS[variant][0]} — {len(surrogate.runs)} cas convergés retenus sur {len(surrogate.all_runs)}.")
 
         inferred_diameter_m = float(df.attrs.get("database_orbital_diameter_m", core.DEFAULT_REF_DIAMETER_M))
         cleaning_report = dict(df.attrs.get("cleaning_report", {}))
@@ -462,7 +515,7 @@ def main() -> None:
         fh_adm_v = as_optional_float(fh_adm_text)
 
         ts_surrogate = None
-        if want_timeseries:
+        if want_timeseries and variant == 'reference':
             if source_kind == "uploaded":
                 ts_surrogate = build_timeseries_surrogate_from_bytes(uploaded.getvalue())
             else:
@@ -505,15 +558,20 @@ def main() -> None:
             lambda_candidates = sorted(df["Lambda [-]"].dropna().unique())
             bmax_candidates = sorted(df["Bmax[°]"].dropna().unique())
 
-            best, table = core.optimize_operating_point(
-                lambda_candidates=lambda_candidates,
-                bmax_candidates=bmax_candidates,
-                objective=objective,
-                min_thrust_propulsive_N=min_thrust_v,
-                max_Mh_Nm=max_mh_v,
-                max_DHP_W=max_dhp_v,
-                **common_kwargs,
-            )
+            try:
+                best, table = core.optimize_operating_point(
+                    lambda_candidates=lambda_candidates,
+                    bmax_candidates=bmax_candidates,
+                    objective=objective,
+                    min_thrust_propulsive_N=min_thrust_v,
+                    max_Mh_Nm=max_mh_v,
+                    max_DHP_W=max_dhp_v,
+                    **common_kwargs,
+                )
+            except RuntimeError as exc:
+                st.error(str(exc) + ' Pour une variante, vérifiez aussi la couverture des cas convergés à la vitesse équivalente demandée.')
+                st.stop()
+            render_campaign_quality(best)
             law = core.suggest_bmax_law_for_target(
                 lambda_candidates=lambda_candidates,
                 bmax_candidates=bmax_candidates,
@@ -523,7 +581,7 @@ def main() -> None:
                 max_DHP_W=max_dhp_v,
                 **common_kwargs,
             )
-            raw_env = core.suggest_raw_bmax_envelope(df)
+            raw_env = core.suggest_raw_bmax_envelope(surrogate.runs if variant != 'reference' else df)
 
             sort_col = {
                 "max_eta": "eta_Cp[%]",
@@ -544,6 +602,10 @@ def main() -> None:
                     "DHP[W]",
                     "thrust_per_power",
                     "status",
+                    'campaign_quality',
+                    'campaign_variant',
+                    'campaign_run',
+                    'campaign_warning',
                     "domain_warning",
                     "_used_nearest_fallback",
                 ]
@@ -565,6 +627,7 @@ def main() -> None:
 
             st.subheader("Facteurs utilises")
             meta_cols = [
+                'campaign_variant', 'campaign_quality', 'campaign_run',
                 "V_reference_in_database_ms",
                 "blade_length_ratio_used",
                 "force_scale_factor",
@@ -624,6 +687,10 @@ def main() -> None:
                 bmax_deg=float(bmax_value),
                 **common_kwargs,
             )
+            if result.get('campaign_supported') is False:
+                st.error(result['campaign_warning'])
+                st.stop()
+            render_campaign_quality(result)
             metrics = [
                 ("eta_Cp [%]", "eta_Cp[%]"),
                 ("Poussee propulsive [N]", "thrust_propulsive[N]"),

@@ -1054,6 +1054,8 @@ def _apply_constraints(
             status = "above_max_Mh"
         if max_DHP_W is not None and row.get("DHP[W]", np.inf) > max_DHP_W:
             status = "above_max_DHP"
+        if 'campaign_supported' in row and not bool(row['campaign_supported']):
+            status = 'campaign_unsupported'
         feasible_flags.append(status == "ok")
         statuses.append(status)
     table["feasible"] = feasible_flags
@@ -1212,6 +1214,7 @@ def suggest_bmax_law_for_target(
                     "omega_rpm": best.get("omega_target_rpm"),
                     "V_reference_in_database_ms": best.get("V_reference_in_database_ms"),
                     "domain_warning": best.get("domain_warning"),
+                    **{key: value for key, value in best.items() if key.startswith('campaign_')},
                 }
             )
         except RuntimeError:
